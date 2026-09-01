@@ -9,7 +9,7 @@ use super::batch_processor::AudioMetricsBatcher;
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use super::devices::AudioDevice;
-use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
+use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType, SegmentSource};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -613,6 +613,10 @@ impl AudioCapture {
             timestamp,
             chunk_id,
             device_type: self.device_type.clone(),
+            segment_source: match self.device_type {
+                DeviceType::Microphone => SegmentSource::Mic,
+                DeviceType::System => SegmentSource::System,
+            },
         };
 
         // NOTE: Raw audio is NOT sent to recording saver to prevent echo
@@ -694,6 +698,9 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Dominant channel of the most recently mixed window, used to tag VAD segments
+    // (including segments recovered at flush, which span no single window)
+    last_segment_source: SegmentSource,
 }
 
 impl AudioPipeline {
@@ -760,6 +767,7 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            last_segment_source: SegmentSource::Mixed,
         }
     }
 
@@ -822,6 +830,10 @@ impl AudioPipeline {
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+                            // Tag which channel dominated this window before the mixer erases identity
+                            let seg_source = dominant_source(&mic_window, &sys_window);
+                            self.last_segment_source = seg_source;
+
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
 
@@ -847,6 +859,7 @@ impl AudioPipeline {
                                                 timestamp: segment.start_timestamp_ms / 1000.0,
                                                 chunk_id: self.chunk_id_counter,
                                                 device_type: DeviceType::Microphone,  // Mixed audio
+                                                segment_source: seg_source,
                                             };
 
                                             if let Err(e) = self.transcription_sender.send(transcription_chunk) {
@@ -873,6 +886,7 @@ impl AudioPipeline {
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
                                     device_type: DeviceType::Microphone,  // Mixed audio
+                                    segment_source: seg_source,
                                 };
                                 let _ = sender.send(recording_chunk);
                             }
@@ -917,6 +931,8 @@ impl AudioPipeline {
                             timestamp: segment.start_timestamp_ms / 1000.0,
                             chunk_id: self.chunk_id_counter,
                             device_type: DeviceType::Microphone,
+                            // No single window backs a flushed segment; use the last window's tag
+                            segment_source: self.last_segment_source,
                         };
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {
@@ -1039,6 +1055,7 @@ impl AudioPipelineManager {
                 timestamp: 0.0,
                 chunk_id: u64::MAX, // Special ID to indicate flush
                 device_type: super::recording_state::DeviceType::Microphone,
+                segment_source: SegmentSource::Mixed,
             };
 
             if let Err(e) = sender.send(flush_chunk) {
@@ -1059,6 +1076,7 @@ impl AudioPipelineManager {
                         timestamp: 0.0,
                         chunk_id: u64::MAX - (i as u64),
                         device_type: super::recording_state::DeviceType::Microphone,
+                        segment_source: SegmentSource::Mixed,
                     };
                     let _ = sender.send(additional_flush);
                 }
@@ -1076,5 +1094,31 @@ impl AudioPipelineManager {
 impl Default for AudioPipelineManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() { return 0.0; }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Mic wins or system wins only when clearly louder (2x RMS); else Mixed.
+fn dominant_source(mic: &[f32], sys: &[f32]) -> SegmentSource {
+    let (m, s) = (rms(mic), rms(sys));
+    if m > s * 2.0 { SegmentSource::Mic }
+    else if s > m * 2.0 { SegmentSource::System }
+    else { SegmentSource::Mixed }
+}
+
+#[cfg(test)]
+mod source_tag_tests {
+    use super::*;
+    #[test]
+    fn tags_dominant_channel() {
+        let loud: Vec<f32> = (0..1600).map(|i| ((i as f32) * 0.1).sin() * 0.5).collect();
+        let quiet: Vec<f32> = vec![0.01; 1600];
+        assert_eq!(dominant_source(&loud, &quiet), SegmentSource::Mic);
+        assert_eq!(dominant_source(&quiet, &loud), SegmentSource::System);
+        assert_eq!(dominant_source(&loud, &loud), SegmentSource::Mixed);
     }
 }
