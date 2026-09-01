@@ -136,6 +136,11 @@ export interface AssistantStatus {
   listening: boolean;
   claudeOk: boolean;
   lastError: string | null;
+  // Bumped by the backend only when last_error is set to a new value, never
+  // on unrelated status changes (mode/listening/enabled toggles). Lets the
+  // panel tell "a fresh error just arrived" apart from "the same error text
+  // is still sitting in state from before".
+  lastErrorSeq: number;
 }
 
 export interface AssistantVoice {

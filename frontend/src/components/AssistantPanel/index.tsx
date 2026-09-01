@@ -68,11 +68,17 @@ export function AssistantPanel() {
   // Quiet, transient status for status.lastError (e.g. Explain finding
   // nothing on the Them channel yet): shows the backend's own message,
   // then clears itself after a few seconds or as soon as a card lands.
+  //
+  // Keyed on lastErrorSeq, not on the lastError string itself: the backend
+  // only bumps the seq when a new error is actually set, so two identical
+  // error strings in a row (e.g. pressing Explain twice with no Them audio
+  // both times) still each show the message. Keying on the string value
+  // would silently drop the second one, since it never "changes".
   const [lastErrorMessage, setLastErrorMessage] = useState<string | null>(null);
   const clearLastErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    if (!status.lastError) return;
+    if (!status.lastError || status.lastErrorSeq === 0) return;
 
     setLastErrorMessage(status.lastError);
 
@@ -84,7 +90,7 @@ export function AssistantPanel() {
     return () => {
       if (clearLastErrorTimer.current) clearTimeout(clearLastErrorTimer.current);
     };
-  }, [status.lastError]);
+  }, [status.lastErrorSeq]);
 
   const prevCardCountRef = useRef(cards.length);
   useEffect(() => {

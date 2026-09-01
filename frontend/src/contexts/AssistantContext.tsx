@@ -19,6 +19,7 @@ const DEFAULT_STATUS: AssistantStatus = {
   listening: false,
   claudeOk: true,
   lastError: null,
+  lastErrorSeq: 0,
 };
 
 const DEFAULT_VOICE: AssistantVoice = { state: 'off', heard: '' };
