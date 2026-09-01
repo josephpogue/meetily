@@ -445,7 +445,11 @@ pub async fn save_note(handle: &AssistantHandle) {
 
     match note::save_note(&vault_root, &date, &draft, &transcript_text, &qa_log_text, dry_run) {
         Ok(paths) => {
-            log::info!("assistant: note saved: {:?}", paths);
+            if dry_run {
+                log::info!("assistant: dry-run, not written: {:?}", paths);
+            } else {
+                log::info!("assistant: note saved: {:?}", paths);
+            }
             core.note_state = NoteState::Saved;
             core.note_error = None;
         }
