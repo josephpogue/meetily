@@ -592,7 +592,7 @@ impl AnswerLanes {
         };
         self.state.lock().unwrap().catchup_used = true;
         if body.is_empty() {
-            log::debug!("catch-up: no transcript yet");
+            log::info!("catch-up: no transcript yet");
             return;
         }
         self.fast_only(
@@ -604,6 +604,7 @@ impl AnswerLanes {
     }
 
     fn fast_only(&mut self, kind: CardKind, question: String, body: String, emit: EmitFn) {
+        log::info!("assistant fast-only request entered: kind={:?}", kind);
         let cfg = { self.state.lock().unwrap().cfg.clone() };
         let Some(cfg) = cfg else {
             log::warn!("assistant fast-only request dropped: lanes are not configured yet");
@@ -614,6 +615,7 @@ impl AnswerLanes {
             log::warn!("assistant fast-only request dropped: lanes are not open yet");
             return;
         };
+        log::info!("assistant fast-only request past guards, spawning a turn: kind={:?}", kind);
 
         let card_id = uuid::Uuid::new_v4().to_string();
         let fast_fork = {
@@ -652,6 +654,10 @@ impl AnswerLanes {
             move |parsed: ParsedCard| {
                 done_state.lock().unwrap().fast_in_flight = false;
                 if parsed.is_skip || parsed.is_empty {
+                    log::info!(
+                        "assistant fast-only turn finished with nothing to show: kind={:?} is_skip={} is_empty={}",
+                        kind, parsed.is_skip, parsed.is_empty
+                    );
                     return;
                 }
                 // Nothing to verify, so it is neutral ink the moment it lands.

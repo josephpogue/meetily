@@ -104,6 +104,10 @@ pub struct AssistantCore {
     note_markdown: String,
     note_error: Option<String>,
     session_transcript: String,
+
+    /// Edge-triggered so `on_transcript_update`'s drop condition logs once
+    /// per state change instead of once per transcript chunk.
+    transcript_ingest_ok: bool,
 }
 
 impl Default for AssistantCore {
@@ -132,6 +136,7 @@ impl Default for AssistantCore {
             note_markdown: String::new(),
             note_error: None,
             session_transcript: String::new(),
+            transcript_ingest_ok: false,
         }
     }
 }
@@ -464,7 +469,18 @@ pub async fn discard_note(handle: &AssistantHandle) {
 async fn on_transcript_update(handle: &AssistantHandle, update: TranscriptUpdate) {
     let mut core = handle.0.lock().await;
     if !core.enabled || !core.session_open {
+        if core.transcript_ingest_ok {
+            core.transcript_ingest_ok = false;
+            log::info!(
+                "assistant: transcript updates now dropping, enabled={} session_open={}",
+                core.enabled, core.session_open
+            );
+        }
         return;
+    }
+    if !core.transcript_ingest_ok {
+        core.transcript_ingest_ok = true;
+        log::info!("assistant: transcript updates now reaching the assistant log");
     }
     let outs = core.transcript.ingest(&update);
     for out in outs {
@@ -476,6 +492,10 @@ async fn on_transcript_update(handle: &AssistantHandle, update: TranscriptUpdate
                 core.trigger.consume_running(speaker, &text);
             }
             AssemblerOut::Utterance { speaker, text } => {
+                log::info!(
+                    "assistant: transcript utterance ingested, speaker={:?} len={}",
+                    speaker, text.len()
+                );
                 if speaker == Speaker::You && core.voice.is_capturing() {
                     core.voice.note_utterance(&text);
                 }
@@ -500,6 +520,10 @@ async fn open_lanes_with(handle: &AssistantHandle, cfg: LaneConfig, seed: String
     } else {
         Some("assistant lanes failed to open".to_string())
     };
+    log::info!(
+        "assistant: session opened, session_open=true lanes_ready={}",
+        core.lanes_ready
+    );
     core.emit_status();
 }
 
@@ -507,6 +531,7 @@ async fn open_lanes_with(handle: &AssistantHandle, cfg: LaneConfig, seed: String
 /// before this meeting takes effect), resets the session, and opens both
 /// lanes if the assistant is enabled and claude resolves.
 async fn open_session(handle: &AssistantHandle) {
+    log::info!("assistant: open_session entered");
     let app = { handle.0.lock().await.app.clone() };
 
     let settings = match &app {
@@ -557,6 +582,7 @@ async fn open_session(handle: &AssistantHandle) {
         }
     };
     if !cfg_ready {
+        log::info!("assistant: open_session stopped, the assistant is disabled in settings");
         return;
     }
 
@@ -683,6 +709,7 @@ async fn wire(app: AppHandle<Wry>) {
     }
 
     register_listeners(app, handle);
+    log::info!("assistant: listeners registered, wire() complete");
 }
 
 fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
@@ -701,6 +728,7 @@ fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
     {
         let handle = handle.clone();
         app.listen("recording-started", move |_event| {
+            log::info!("assistant: recording-started event received");
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 open_session(&handle).await;
@@ -709,6 +737,7 @@ fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
     }
     {
         app.listen("recording-stopped", move |_event| {
+            log::info!("assistant: recording-stopped event received");
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 close_session(&handle).await;
