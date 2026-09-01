@@ -8,6 +8,7 @@
 pub mod card;
 pub mod claude_cli;
 pub mod lanes;
+pub mod note;
 pub mod settings;
 pub mod transcript;
 pub mod trigger;
