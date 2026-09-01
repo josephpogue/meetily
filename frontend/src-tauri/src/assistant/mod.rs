@@ -8,6 +8,7 @@
 pub mod claude_cli;
 pub mod settings;
 pub mod transcript;
+pub mod trigger;
 
 use std::sync::Arc;
 use tauri::State;
