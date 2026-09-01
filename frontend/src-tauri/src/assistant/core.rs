@@ -58,6 +58,12 @@ pub struct StatusOut {
     pub listening: bool,
     pub claude_ok: bool,
     pub last_error: Option<String>,
+    /// Bumped every time `last_error` is set to a new `Some(...)`, never on
+    /// a clear or on an unrelated `emit_status()`. The panel keys its
+    /// transient error display on this instead of the string value, so a
+    /// second error with identical text (or a stale value re-forwarded by
+    /// some other status change) is still distinguishable from silence.
+    pub last_error_seq: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +103,7 @@ pub struct AssistantCore {
     lanes_ready: bool,
     claude_ok: bool,
     last_error: Option<String>,
+    last_error_seq: u64,
     mode: TriggerMode,
     listening: bool,
 
@@ -134,6 +141,7 @@ impl Default for AssistantCore {
             lanes_ready: false,
             claude_ok: false,
             last_error: None,
+            last_error_seq: 0,
             mode: TriggerMode::Gated,
             listening: true,
             pending_brief: None,
@@ -157,7 +165,18 @@ impl AssistantCore {
             listening: self.listening,
             claude_ok: self.claude_ok,
             last_error: self.last_error.clone(),
+            last_error_seq: self.last_error_seq,
         }
+    }
+
+    /// The single place `last_error` gets assigned. Bumps `last_error_seq`
+    /// on a new `Some(...)`, leaves it alone on a clear -- callers just set
+    /// the value they mean, without having to remember the counter exists.
+    fn set_last_error(&mut self, err: Option<String>) {
+        if err.is_some() {
+            self.last_error_seq += 1;
+        }
+        self.last_error = err;
     }
 
     fn emit_status(&self) {
@@ -369,7 +388,7 @@ pub async fn set_brief(handle: &AssistantHandle, text: String) {
 /// happened.
 fn drop_closed_session(core: &mut AssistantCore, action: &str) {
     log::info!("assistant: {} dropped, no open session", action);
-    core.last_error = Some("Assistant session is not open yet.".to_string());
+    core.set_last_error(Some("Assistant session is not open yet.".to_string()));
     core.emit_status();
 }
 
@@ -380,7 +399,7 @@ fn drop_closed_session(core: &mut AssistantCore, action: &str) {
 /// be off, since that is the more specific and more actionable of the two.
 fn drop_disabled(core: &mut AssistantCore, action: &str) {
     log::debug!("assistant: {} dropped, assistant disabled", action);
-    core.last_error = Some("Assistant is turned off.".to_string());
+    core.set_last_error(Some("Assistant is turned off.".to_string()));
     core.emit_status();
 }
 
@@ -415,7 +434,7 @@ pub async fn explain(handle: &AssistantHandle) {
     let AssistantCore { lanes, transcript, .. } = &mut *core;
     let result = lanes.explain(transcript, emit);
     if let Err(e) = result {
-        core.last_error = Some(e);
+        core.set_last_error(Some(e));
         core.emit_status();
     }
 }
@@ -615,11 +634,12 @@ async fn open_lanes_with(handle: &AssistantHandle, cfg: LaneConfig, seed: String
     core.lanes.open(seed, &cfg, emit).await;
     core.lanes_ready = core.lanes.is_ready();
     core.session_open = true;
-    core.last_error = if core.lanes_ready {
+    let lanes_ready = core.lanes_ready;
+    core.set_last_error(if lanes_ready {
         None
     } else {
         Some("assistant lanes failed to open".to_string())
-    };
+    });
     log::info!(
         "assistant: session opened, session_open=true lanes_ready={}",
         core.lanes_ready
@@ -699,10 +719,12 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         let mut core = handle.0.lock().await;
         core.claude_ok = probe.ok;
         if bin.is_none() {
-            core.last_error = probe
-                .error
-                .clone()
-                .or_else(|| Some("claude binary not found".to_string()));
+            core.set_last_error(
+                probe
+                    .error
+                    .clone()
+                    .or_else(|| Some("claude binary not found".to_string())),
+            );
             core.emit_status();
             return;
         }
@@ -714,7 +736,7 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         .join(uuid::Uuid::new_v4().to_string());
     if let Err(e) = std::fs::create_dir_all(&session_dir) {
         let mut core = handle.0.lock().await;
-        core.last_error = Some(format!("could not create the assistant session dir: {}", e));
+        core.set_last_error(Some(format!("could not create the assistant session dir: {}", e)));
         core.emit_status();
         return;
     }
@@ -1054,5 +1076,33 @@ mod tests {
         let core = handle.0.lock().await;
         assert!(!core.lanes_ready);
         assert_eq!(core.last_error.as_deref(), Some("assistant lanes failed to open"));
+    }
+
+    /// The panel keys its transient error display on `last_error_seq`
+    /// because two errors with identical text (pressing Explain twice with
+    /// nothing new to explain, say) still both need to show. Repeated
+    /// identical text must still bump the counter each time, and a status
+    /// emit that never touches `last_error` (set_listening, in this case)
+    /// must never bump it -- that would falsely re-flash a stale error on
+    /// an unrelated toggle.
+    #[tokio::test]
+    async fn last_error_seq_bumps_on_repeat_and_stays_put_on_unrelated_emits() {
+        let handle = AssistantHandle::new();
+
+        explain(&handle).await;
+        let after_first = get_state(&handle).await.last_error_seq;
+        assert!(after_first > 0);
+
+        explain(&handle).await;
+        let after_second = get_state(&handle).await;
+        assert_eq!(
+            after_second.last_error.as_deref(),
+            Some("Assistant session is not open yet.")
+        );
+        assert_eq!(after_second.last_error_seq, after_first + 1);
+
+        set_listening(&handle, false).await;
+        let after_unrelated = get_state(&handle).await.last_error_seq;
+        assert_eq!(after_unrelated, after_second.last_error_seq);
     }
 }
