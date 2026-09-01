@@ -276,16 +276,33 @@ pub async fn get_state(handle: &AssistantHandle) -> StatusOut {
 }
 
 pub async fn set_enabled(handle: &AssistantHandle, enabled: bool) {
-    let already_open = {
+    let (already_open, app) = {
         let mut core = handle.0.lock().await;
         core.enabled = enabled;
         if !enabled {
             core.lanes.close();
             core.voice.cancel();
+            // Otherwise every other path (`ask`/`explain`/`catchup`,
+            // the panel's own `actionsDisabled`) disagrees with reality:
+            // lanes are closed but session_open still claims a live
+            // session, and explain/catchup have no `enabled` guard of
+            // their own to catch it.
+            core.session_open = false;
         }
         core.emit_status();
-        core.session_open
+        (core.session_open, core.app.clone())
     };
+
+    // The panel switch is the user's explicit intent, not a transient
+    // runtime toggle -- persist it so the next recording's `open_session`
+    // (which reloads settings fresh from the DB) doesn't read a stale row
+    // and silently revert the choice just made.
+    if let Some(state) = app.as_ref().and_then(|a| a.try_state::<crate::state::AppState>()) {
+        if let Err(e) = settings::AssistantSettings::persist_enabled(state.db_manager.pool(), enabled).await {
+            log::warn!("assistant: failed to persist enabled={}: {}", enabled, e);
+        }
+    }
+
     if !enabled || already_open {
         return;
     }
@@ -356,6 +373,17 @@ fn drop_closed_session(core: &mut AssistantCore, action: &str) {
     core.emit_status();
 }
 
+/// Same shape as `drop_closed_session`, for the other reason a press can be
+/// dropped: the session is open but the assistant itself is off. Every
+/// entry point checks `session_open` before `enabled` -- a closed session
+/// gets the closed-session message even if the assistant also happens to
+/// be off, since that is the more specific and more actionable of the two.
+fn drop_disabled(core: &mut AssistantCore, action: &str) {
+    log::debug!("assistant: {} dropped, assistant disabled", action);
+    core.last_error = Some("Assistant is turned off.".to_string());
+    core.emit_status();
+}
+
 /// Fires on a trigger, a typed ask, and a submitted voice ask alike. `extra`
 /// reaches the model's prompt only, never the card's displayed question.
 pub async fn ask(handle: &AssistantHandle, question: String, kind: CardKind, extra: Option<&str>) {
@@ -365,9 +393,7 @@ pub async fn ask(handle: &AssistantHandle, question: String, kind: CardKind, ext
         return;
     }
     if !core.enabled {
-        log::debug!("assistant: ask dropped, assistant disabled");
-        core.last_error = Some("Assistant is turned off.".to_string());
-        core.emit_status();
+        drop_disabled(&mut core, "ask");
         return;
     }
     let emit = core.card_emit.clone();
@@ -379,6 +405,10 @@ pub async fn explain(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
     if !core.session_open {
         drop_closed_session(&mut core, "explain");
+        return;
+    }
+    if !core.enabled {
+        drop_disabled(&mut core, "explain");
         return;
     }
     let emit = core.card_emit.clone();
@@ -394,6 +424,10 @@ pub async fn catchup(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
     if !core.session_open {
         drop_closed_session(&mut core, "catch-up");
+        return;
+    }
+    if !core.enabled {
+        drop_disabled(&mut core, "catch-up");
         return;
     }
     let emit = core.card_emit.clone();
@@ -940,6 +974,56 @@ mod tests {
     async fn set_enabled_true_does_not_open_a_session_without_a_recording() {
         let handle = AssistantHandle::new();
         set_enabled(&handle, true).await;
+        assert!(!get_state(&handle).await.session_open);
+    }
+
+    /// A session can be open while the assistant itself is off (toggled off
+    /// mid-recording, or disabled by default while a recording that predates
+    /// it is still going). explain/catchup must not fire a real Claude call
+    /// in that state -- they have to stop at the same `enabled` guard `ask`
+    /// already had, not just at `session_open`.
+    #[tokio::test]
+    async fn explain_and_catchup_set_last_error_when_session_open_but_disabled() {
+        let handle = AssistantHandle::new();
+        {
+            let mut core = handle.0.lock().await;
+            core.session_open = true;
+            core.enabled = false;
+        }
+
+        explain(&handle).await;
+        assert_eq!(
+            get_state(&handle).await.last_error.as_deref(),
+            Some("Assistant is turned off.")
+        );
+
+        catchup(&handle).await;
+        assert_eq!(
+            get_state(&handle).await.last_error.as_deref(),
+            Some("Assistant is turned off.")
+        );
+
+        // Neither call touched the lanes: still the untouched default,
+        // never opened.
+        let core = handle.0.lock().await;
+        assert!(!core.lanes_ready);
+    }
+
+    /// `set_enabled(false)` must leave every piece of state agreeing the
+    /// session is closed, not just the lanes. Otherwise `ask`/`explain`/
+    /// `catchup` (which check `session_open` first) would sail past their
+    /// guard into lanes that were just closed out from under them.
+    #[tokio::test]
+    async fn set_enabled_false_closes_the_session_too() {
+        let handle = AssistantHandle::new();
+        {
+            let mut core = handle.0.lock().await;
+            core.session_open = true;
+            core.enabled = true;
+        }
+
+        set_enabled(&handle, false).await;
+
         assert!(!get_state(&handle).await.session_open);
     }
 

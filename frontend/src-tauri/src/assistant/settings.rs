@@ -92,6 +92,25 @@ impl AssistantSettings {
 
         Ok(())
     }
+
+    /// Persists just the `enabled` column, independent of `save`'s full-row
+    /// upsert. The panel switch only ever knows the on/off it just set, not
+    /// the rest of the settings row (fast/deep model, names, etc.); a full
+    /// `save()` from a possibly-stale in-memory `AssistantSettings` would
+    /// silently clobber whatever the settings page saved after that.
+    pub async fn persist_enabled(pool: &SqlitePool, enabled: bool) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO assistant_settings (id, enabled) VALUES ('1', $1)
+            ON CONFLICT(id) DO UPDATE SET enabled = excluded.enabled
+            "#,
+        )
+        .bind(enabled)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -206,6 +225,23 @@ mod tests {
 
         let reloaded = AssistantSettings::load(&pool).await.unwrap();
         assert!(!reloaded.enabled);
+        assert_eq!(reloaded.trigger_mode, "continuous");
+        assert_eq!(reloaded.names, "joseph,jp");
+    }
+
+    #[tokio::test]
+    async fn persist_enabled_touches_only_the_enabled_column() {
+        let pool = test_pool().await;
+        let mut s = AssistantSettings::load(&pool).await.unwrap();
+        s.trigger_mode = "continuous".to_string();
+        s.names = "joseph,jp".to_string();
+        s.save(&pool).await.unwrap();
+
+        AssistantSettings::persist_enabled(&pool, false).await.unwrap();
+
+        let reloaded = AssistantSettings::load(&pool).await.unwrap();
+        assert!(!reloaded.enabled);
+        // Untouched by the narrow update.
         assert_eq!(reloaded.trigger_mode, "continuous");
         assert_eq!(reloaded.names, "joseph,jp");
     }
