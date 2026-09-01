@@ -562,11 +562,11 @@ impl AnswerLanes {
 
     /// Explain and catch-up are transcript-local. There is nothing to
     /// verify, so they are fast-lane only and land already checked.
-    pub fn explain(&mut self, log: &TranscriptLog, emit: EmitFn) {
+    pub fn explain(&mut self, log: &TranscriptLog, emit: EmitFn) -> Result<(), String> {
         let window = log.window(EXPLAIN_WINDOW_SECS, Some(Speaker::Them));
         if window.is_empty() {
-            log::debug!("explain: nothing on the Them channel yet");
-            return;
+            log::info!("explain: nothing on the Them channel yet, nothing to explain");
+            return Err("Nothing from the other side yet to explain.".to_string());
         }
         self.fast_only(
             CardKind::Explain,
@@ -577,6 +577,7 @@ impl AnswerLanes {
             ),
             emit,
         );
+        Ok(())
     }
 
     pub fn catchup(&mut self, log: &TranscriptLog, emit: EmitFn) {

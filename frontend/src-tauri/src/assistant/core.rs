@@ -335,16 +335,22 @@ pub async fn ask(handle: &AssistantHandle, question: String, kind: CardKind, ext
 pub async fn explain(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
     if !core.session_open {
+        log::info!("assistant: explain dropped, no open session");
         return;
     }
     let emit = core.card_emit.clone();
     let AssistantCore { lanes, transcript, .. } = &mut *core;
-    lanes.explain(transcript, emit);
+    let result = lanes.explain(transcript, emit);
+    if let Err(e) = result {
+        core.last_error = Some(e);
+        core.emit_status();
+    }
 }
 
 pub async fn catchup(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
     if !core.session_open {
+        log::info!("assistant: catch-up dropped, no open session");
         return;
     }
     let emit = core.card_emit.clone();

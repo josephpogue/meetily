@@ -143,17 +143,29 @@ impl TranscriptLog {
         (text, self.finals.len())
     }
 
-    /// Labeled finals from the last `seconds` of audio, optionally filtered to one speaker.
-    pub fn window(&self, seconds: f64, speaker: Option<Speaker>) -> String {
-        let now = self
-            .finals
-            .iter()
-            .map(|(_, _, end)| *end)
-            .chain(self.open.as_ref().map(|o| o.end_time))
-            .fold(0.0_f64, f64::max);
-
+    /// Closed finals plus the still-open utterance's committed text (not its
+    /// in-flight partial preview, which isn't stable yet). Without this, an
+    /// utterance is invisible to `window`/`all` until a >=1.2s gap or a
+    /// speaker flip closes it -- which a user pressing Explain or Catch-up
+    /// moments after someone finishes speaking will routinely beat, and which
+    /// one long unbroken utterance may never do at all.
+    fn entries(&self) -> impl Iterator<Item = (Speaker, &str, f64)> {
         self.finals
             .iter()
+            .map(|(s, t, e)| (*s, t.as_str(), *e))
+            .chain(
+                self.open
+                    .as_ref()
+                    .filter(|o| !o.committed_text.is_empty())
+                    .map(|o| (o.speaker, o.committed_text.as_str(), o.end_time)),
+            )
+    }
+
+    /// Labeled finals from the last `seconds` of audio, optionally filtered to one speaker.
+    pub fn window(&self, seconds: f64, speaker: Option<Speaker>) -> String {
+        let now = self.entries().map(|(_, _, end)| end).fold(0.0_f64, f64::max);
+
+        self.entries()
             .filter(|(_, _, end)| now - end <= seconds)
             .filter(|(s, _, _)| speaker.map(|want| want == *s).unwrap_or(true))
             .map(|(s, text, _)| format!("{}: {}", s.label(), text))
@@ -162,8 +174,7 @@ impl TranscriptLog {
     }
 
     pub fn all(&self) -> String {
-        self.finals
-            .iter()
+        self.entries()
             .map(|(speaker, text, _)| format!("{}: {}", speaker.label(), text))
             .collect::<Vec<_>>()
             .join("\n")
@@ -297,5 +308,44 @@ mod tests {
 
         let out = log.window(15.0, Some(Speaker::Them));
         assert_eq!(out, "Them: recent them");
+    }
+
+    /// Explain's real usage: press it moments after the other side finishes
+    /// talking, well inside the 1.2s gap that would otherwise close the
+    /// utterance. Reproduces Explain returning nothing even though the
+    /// speaker was tagged correctly.
+    #[test]
+    fn window_sees_a_still_open_utterance() {
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("system", "Joseph, what does the assistant do", 0.0, 4.0, false, 1));
+
+        let out = log.window(15.0, Some(Speaker::Them));
+        assert_eq!(out, "Them: Joseph, what does the assistant do");
+    }
+
+    /// Catch-up's first-use path: one long stretch of speech with no gap
+    /// ever reaching 1.2s and no speaker flip never closes, so `finals`
+    /// stays empty for the whole stretch. Reproduces catch-up finding zero
+    /// transcript despite minutes of real speech.
+    #[test]
+    fn all_sees_a_still_open_utterance_that_never_closed() {
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("mic", "one", 0.0, 1.0, false, 1));
+        log.ingest(&tu("mic", "two", 1.5, 2.5, false, 2));
+        log.ingest(&tu("mic", "three", 3.0, 4.0, false, 3));
+
+        assert_eq!(log.all(), "You: one two three");
+    }
+
+    /// The in-flight partial preview is not yet finalized text and must not
+    /// leak into a lane prompt.
+    #[test]
+    fn window_excludes_the_open_utterance_pending_partial() {
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("system", "committed", 0.0, 1.0, false, 1));
+        log.ingest(&tu("system", "not yet final", 1.1, 1.4, true, 2));
+
+        let out = log.window(15.0, Some(Speaker::Them));
+        assert_eq!(out, "Them: committed");
     }
 }
