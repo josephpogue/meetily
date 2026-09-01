@@ -58,7 +58,6 @@ export function AskBox({ disabled }: AskBoxProps) {
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Ask a question"
-          disabled={disabled}
           className="flex-1"
         />
         <Button
