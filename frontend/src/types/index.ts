@@ -108,3 +108,61 @@ export interface TranscriptSegmentData {
   text: string;
   confidence?: number;
 }
+
+// Live assistant types (contract pinned in docs/superpowers/specs/2026-09-01-live-assistant-design.md)
+
+export type AssistantCardPhase = 'drafting' | 'checked' | 'corrected';
+export type AssistantCardKind = 'answer' | 'ask' | 'explain' | 'catchup';
+
+export interface AssistantCard {
+  id: string;
+  kind: AssistantCardKind;
+  question: string;
+  lead: string;
+  bullets: string[];
+  source: string;
+  phase: AssistantCardPhase;
+  changedLines: string[];
+  ts: number;
+}
+
+export interface AssistantStatus {
+  enabled: boolean;
+  sessionOpen: boolean;
+  lanesReady: boolean;
+  mode: 'manual' | 'gated' | 'continuous';
+  listening: boolean;
+  claudeOk: boolean;
+  lastError: string | null;
+}
+
+export interface AssistantVoice {
+  state: 'off' | 'listening' | 'submitting';
+  heard: string;
+}
+
+export interface AssistantNote {
+  state: 'idle' | 'drafting' | 'ready' | 'saved' | 'failed';
+  markdown: string;
+  error: string | null;
+}
+
+export interface AssistantSettings {
+  enabled: boolean;
+  claudePath: string;
+  fastModel: string;
+  fastEffort: string;
+  deepModel: string;
+  deepEffort: string;
+  triggerMode: 'manual' | 'gated' | 'continuous';
+  quietGapSecs: number;
+  names: string;
+  vaultRoot: string;
+  deepReadDirs: string;
+}
+
+export interface AssistantClaudeProbe {
+  ok: boolean;
+  version: string;
+  error: string | null;
+}
