@@ -13,6 +13,7 @@ use std::{fs, io};
 /// `note_prompt` field so `lanes.rs` never depends on this file directly.
 pub const NOTE_PROMPT: &str = include_str!("prompts/note.md");
 
+#[derive(Debug, Clone)]
 pub struct NoteDraft {
     pub slug: String,
     pub markdown: String,

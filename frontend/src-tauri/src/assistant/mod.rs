@@ -7,6 +7,8 @@
 
 pub mod card;
 pub mod claude_cli;
+pub mod commands;
+pub mod core;
 pub mod lanes;
 pub mod note;
 pub mod settings;
@@ -18,16 +20,10 @@ use std::sync::Arc;
 use tauri::State;
 use tokio::sync::Mutex;
 
+pub use core::AssistantCore;
 pub use settings::{AssistantSettings, ClaudeProbe};
 
 use crate::state::AppState;
-
-/// Assistant state. Filled in across later tasks: transcript log, trigger
-/// engine, answer lanes, voice ask and note flow all land here.
-#[derive(Default)]
-pub struct AssistantCore {
-    pub settings: AssistantSettings,
-}
 
 #[derive(Clone)]
 pub struct AssistantHandle(pub Arc<Mutex<AssistantCore>>);

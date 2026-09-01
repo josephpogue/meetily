@@ -79,7 +79,8 @@ pub struct LaneConfig {
     pub note_prompt: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum CardKind {
     Answer,
     Ask,
@@ -87,7 +88,8 @@ pub enum CardKind {
     Catchup,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CardOut {
     pub id: String,
     pub kind: CardKind,
@@ -169,7 +171,7 @@ fn build_turn(call: LaneCall) -> ClaudeTurn {
     turn
 }
 
-fn turn_prompt(delta: &str, trigger: &str) -> String {
+fn turn_prompt(delta: &str, trigger: &str, extra: Option<&str>) -> String {
     let mut out = String::new();
     if !delta.is_empty() {
         out.push_str("NEW TRANSCRIPT since your last turn:\n");
@@ -178,7 +180,13 @@ fn turn_prompt(delta: &str, trigger: &str) -> String {
     }
     out.push_str("TRIGGER: ");
     out.push_str(trigger);
-    out.push_str("\n\nAnswer in the card format, or reply SKIP.");
+    out.push('\n');
+    if let Some(extra) = extra {
+        out.push('\n');
+        out.push_str(extra);
+        out.push('\n');
+    }
+    out.push_str("\nAnswer in the card format, or reply SKIP.");
     out
 }
 
@@ -399,6 +407,15 @@ impl AnswerLanes {
         (self.runner)(turn, on_delta, register).await
     }
 
+    /// Whether both lanes forked successfully. False while `open` is still
+    /// running, or after it failed (a missing/unauthenticated claude binary,
+    /// a killed trunk seed, and so on): every trigger and command that needs
+    /// a lane checks this first rather than assuming `open` succeeded.
+    pub fn is_ready(&self) -> bool {
+        let s = self.state.lock().unwrap();
+        s.fast_id.is_some() && s.deep_id.is_some()
+    }
+
     pub fn close(&mut self) {
         let handles: Vec<TurnHandle> = {
             let mut s = self.state.lock().unwrap();
@@ -414,6 +431,20 @@ impl AnswerLanes {
     /// A proactive or gated trigger: both lanes fire, fast streams, deep
     /// settles.
     pub fn answer(&mut self, question: String, kind: CardKind, log: &TranscriptLog, emit: EmitFn) {
+        self.answer_with_note(question, None, kind, log, emit);
+    }
+
+    /// Same as `answer`, with `extra` appended to the turn prompt only
+    /// (never shown as the card's question). Used for a direct ask, which
+    /// must never SKIP, without polluting what Joseph sees on the card.
+    pub fn answer_with_note(
+        &mut self,
+        question: String,
+        extra: Option<&str>,
+        kind: CardKind,
+        log: &TranscriptLog,
+        emit: EmitFn,
+    ) {
         let cfg = { self.state.lock().unwrap().cfg.clone() };
         let Some(cfg) = cfg else {
             log::warn!("assistant trigger dropped: lanes are not configured yet");
@@ -457,7 +488,7 @@ impl AnswerLanes {
             fork: fast_fork,
             cwd: cfg.cwd.clone(),
             add_dirs: Vec::new(),
-            prompt: turn_prompt(&fast_delta_text, &question),
+            prompt: turn_prompt(&fast_delta_text, &question, extra),
             partial: true,
         });
         let stream_emit = emit.clone();
@@ -502,7 +533,7 @@ impl AnswerLanes {
             fork: deep_fork,
             cwd: cfg.cwd.clone(),
             add_dirs: cfg.deep_read_dirs.clone(),
-            prompt: turn_prompt(&deep_delta_text, &question),
+            prompt: turn_prompt(&deep_delta_text, &question, extra),
             partial: true,
         });
         let settle_state = self.state.clone();

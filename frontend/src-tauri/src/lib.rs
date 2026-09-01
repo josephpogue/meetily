@@ -511,6 +511,12 @@ pub fn run() {
                 log::warn!("Failed to resolve resource directory for templates");
             }
 
+            // Wire the live meeting assistant: transcript-update /
+            // recording-started / recording-stopped listeners, trigger
+            // engine, answer lanes, voice ask. Never blocks setup; failures
+            // land in assistant-status, not here.
+            assistant::core::install(_app.handle().clone());
+
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -754,6 +760,20 @@ pub fn run() {
             assistant::assistant_get_settings,
             assistant::assistant_save_settings,
             assistant::assistant_test_claude,
+            assistant::commands::assistant_get_state,
+            assistant::commands::assistant_set_enabled,
+            assistant::commands::assistant_ask,
+            assistant::commands::assistant_explain,
+            assistant::commands::assistant_catchup,
+            assistant::commands::assistant_set_mode,
+            assistant::commands::assistant_set_listening,
+            assistant::commands::assistant_voice_start,
+            assistant::commands::assistant_voice_finish,
+            assistant::commands::assistant_voice_cancel,
+            assistant::commands::assistant_draft_note,
+            assistant::commands::assistant_save_note,
+            assistant::commands::assistant_discard_note,
+            assistant::commands::assistant_set_brief,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
