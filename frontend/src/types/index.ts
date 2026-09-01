@@ -21,7 +21,7 @@ export interface Transcript {
 export interface TranscriptUpdate {
   text: string;
   timestamp: string; // Wall-clock time for reference
-  source: string;
+  source: string; // "mic" | "system" | "mixed" (dominant channel, not diarization)
   sequence_id: number;
   chunk_start_time: number; // Legacy field
   is_partial: boolean;
