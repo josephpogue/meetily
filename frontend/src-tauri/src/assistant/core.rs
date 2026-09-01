@@ -276,13 +276,28 @@ pub async fn get_state(handle: &AssistantHandle) -> StatusOut {
 }
 
 pub async fn set_enabled(handle: &AssistantHandle, enabled: bool) {
-    let mut core = handle.0.lock().await;
-    core.enabled = enabled;
-    if !enabled {
-        core.lanes.close();
-        core.voice.cancel();
+    let already_open = {
+        let mut core = handle.0.lock().await;
+        core.enabled = enabled;
+        if !enabled {
+            core.lanes.close();
+            core.voice.cancel();
+        }
+        core.emit_status();
+        core.session_open
+    };
+    if !enabled || already_open {
+        return;
     }
-    core.emit_status();
+    // The session only opens on `recording-started`. If a recording was
+    // already running when the assistant got turned on here, that event
+    // already fired and will not fire again -- without this, the
+    // assistant stays closed for the rest of the recording no matter how
+    // many times the switch is flipped.
+    if crate::audio::recording_commands::is_recording().await {
+        log::info!("assistant: enabled while a recording is already running, opening the session now");
+        open_session(handle, Some(true)).await;
+    }
 }
 
 /// Shared by `set_mode` (explicit, from the settings UI) and `cycle_mode`
@@ -330,12 +345,29 @@ pub async fn set_brief(handle: &AssistantHandle, text: String) {
     core.pending_brief = if text.trim().is_empty() { None } else { Some(text) };
 }
 
+/// Surfaces "the session is not open" as a visible error rather than a
+/// silent no-op. The panel renders `lastError`, so a button press that gets
+/// dropped needs to reach it the same way a lane failure does -- otherwise
+/// pressing Explain, Catch up, or Ask while closed just looks like nothing
+/// happened.
+fn drop_closed_session(core: &mut AssistantCore, action: &str) {
+    log::info!("assistant: {} dropped, no open session", action);
+    core.last_error = Some("Assistant session is not open yet.".to_string());
+    core.emit_status();
+}
+
 /// Fires on a trigger, a typed ask, and a submitted voice ask alike. `extra`
 /// reaches the model's prompt only, never the card's displayed question.
 pub async fn ask(handle: &AssistantHandle, question: String, kind: CardKind, extra: Option<&str>) {
     let mut core = handle.0.lock().await;
-    if !core.enabled || !core.session_open {
-        log::debug!("assistant: dropped a question, no open session");
+    if !core.session_open {
+        drop_closed_session(&mut core, "ask");
+        return;
+    }
+    if !core.enabled {
+        log::debug!("assistant: ask dropped, assistant disabled");
+        core.last_error = Some("Assistant is turned off.".to_string());
+        core.emit_status();
         return;
     }
     let emit = core.card_emit.clone();
@@ -346,7 +378,7 @@ pub async fn ask(handle: &AssistantHandle, question: String, kind: CardKind, ext
 pub async fn explain(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
     if !core.session_open {
-        log::info!("assistant: explain dropped, no open session");
+        drop_closed_session(&mut core, "explain");
         return;
     }
     let emit = core.card_emit.clone();
@@ -361,7 +393,7 @@ pub async fn explain(handle: &AssistantHandle) {
 pub async fn catchup(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
     if !core.session_open {
-        log::info!("assistant: catch-up dropped, no open session");
+        drop_closed_session(&mut core, "catch-up");
         return;
     }
     let emit = core.card_emit.clone();
@@ -564,7 +596,14 @@ async fn open_lanes_with(handle: &AssistantHandle, cfg: LaneConfig, seed: String
 /// Bound to `recording-started`. Reloads settings fresh (so a save made
 /// before this meeting takes effect), resets the session, and opens both
 /// lanes if the assistant is enabled and claude resolves.
-async fn open_session(handle: &AssistantHandle) {
+///
+/// `force_enabled`, when `Some`, wins over the persisted `settings.enabled`
+/// for the open/don't-open decision. `set_enabled` passes this when the
+/// assistant gets flipped on through the panel switch while a recording is
+/// already running: that explicit press should open the session right
+/// away, not defer to a possibly-stale settings row that would otherwise
+/// leave the session closed until the next stop/start cycle.
+async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
     log::info!("assistant: open_session entered");
     let app = { handle.0.lock().await.app.clone() };
 
@@ -606,7 +645,7 @@ async fn open_session(handle: &AssistantHandle) {
         let listening = core.listening;
         core.trigger.update(mode, settings.quiet_gap_secs, listening, names);
 
-        if !settings.enabled {
+        if !force_enabled.unwrap_or(settings.enabled) {
             core.enabled = false;
             core.emit_status();
             (None, false)
@@ -765,7 +804,7 @@ fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
             log::info!("assistant: recording-started event received");
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
-                open_session(&handle).await;
+                open_session(&handle, None).await;
             });
         });
     }
@@ -866,6 +905,42 @@ mod tests {
             other => panic!("expected Listening, got {:?}", other),
         };
         assert_eq!(heard, "let's talk about the roadmap");
+    }
+
+    /// A dropped button press must be visible, not silent: the panel only
+    /// has `lastError` to show, so pressing Ask, Explain, or Catch up while
+    /// closed has to reach it or it just looks like nothing happened.
+    #[tokio::test]
+    async fn ask_explain_and_catchup_set_last_error_when_session_closed() {
+        let handle = AssistantHandle::new();
+
+        ask(&handle, "hello?".to_string(), CardKind::Ask, None).await;
+        assert_eq!(
+            get_state(&handle).await.last_error.as_deref(),
+            Some("Assistant session is not open yet.")
+        );
+
+        explain(&handle).await;
+        assert_eq!(
+            get_state(&handle).await.last_error.as_deref(),
+            Some("Assistant session is not open yet.")
+        );
+
+        catchup(&handle).await;
+        assert_eq!(
+            get_state(&handle).await.last_error.as_deref(),
+            Some("Assistant session is not open yet.")
+        );
+    }
+
+    /// Without an active recording, turning the assistant on must not open
+    /// a session on its own -- only `recording-started`, or `set_enabled`
+    /// catching an already-running recording, should do that.
+    #[tokio::test]
+    async fn set_enabled_true_does_not_open_a_session_without_a_recording() {
+        let handle = AssistantHandle::new();
+        set_enabled(&handle, true).await;
+        assert!(!get_state(&handle).await.session_open);
     }
 
     #[tokio::test]
