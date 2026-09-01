@@ -9,7 +9,7 @@ use super::batch_processor::AudioMetricsBatcher;
 use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 
 use super::devices::AudioDevice;
-use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
+use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType, SegmentSource};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -613,6 +613,10 @@ impl AudioCapture {
             timestamp,
             chunk_id,
             device_type: self.device_type.clone(),
+            segment_source: match self.device_type {
+                DeviceType::Microphone => SegmentSource::Mic,
+                DeviceType::System => SegmentSource::System,
+            },
         };
 
         // NOTE: Raw audio is NOT sent to recording saver to prevent echo
@@ -694,6 +698,22 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    // Dominant channel of the most recently mixed window, used to tag VAD segments
+    // (including segments recovered at flush, which span no single window)
+    last_segment_source: SegmentSource,
+    // Slow-moving per-channel RMS average, used to tag dominance relative to
+    // each channel's own typical level rather than by absolute RMS (mic is
+    // EBU R128-normalized toward a fixed loud target before it reaches this
+    // pipeline; system audio stays raw, so absolute RMS always favors mic).
+    mic_rms_floor: f32,
+    sys_rms_floor: f32,
+    // A VAD speech segment spans many ~50ms mixing windows, but a window's
+    // tag only reflects that window. Tallying every window's tag since the
+    // last completed segment, then majority-voting once the segment closes,
+    // avoids tagging a multi-second segment by whichever channel happened
+    // to dominate only its last (often near-silent, trailing) window.
+    mic_window_votes: u32,
+    sys_window_votes: u32,
 }
 
 impl AudioPipeline {
@@ -760,6 +780,11 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            last_segment_source: SegmentSource::Mixed,
+            mic_rms_floor: 0.0,
+            sys_rms_floor: 0.0,
+            mic_window_votes: 0,
+            sys_window_votes: 0,
         }
     }
 
@@ -822,6 +847,10 @@ impl AudioPipeline {
                     // STEP 2: Mix audio in fixed windows when both streams have sufficient data
                     while self.ring_buffer.can_mix() {
                         if let Some((mic_window, sys_window)) = self.ring_buffer.extract_window() {
+                            // Tag which channel dominated this window before the mixer erases identity
+                            let seg_source = self.tag_dominant_source(&mic_window, &sys_window);
+                            self.last_segment_source = seg_source;
+
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
 
@@ -834,29 +863,51 @@ impl AudioPipeline {
                             // STEP 3: Send mixed audio for transcription (VAD + Whisper)
                             match self.vad_processor.process_audio(&mixed_with_gain) {
                                 Ok(speech_segments) => {
-                                    for segment in speech_segments {
-                                        let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
+                                    // Only a window VAD just accepted into the current
+                                    // speech run gets a vote. A vote cast on every window
+                                    // regardless of VAD state lets minutes of ambient
+                                    // room noise between utterances (near-guaranteed to
+                                    // tip mic-dominant at some point) outvote the much
+                                    // shorter genuinely-dominant speech itself. VAD's own
+                                    // model rejects that noise far better than an energy
+                                    // threshold on our end would.
+                                    if self.vad_processor.is_in_speech() {
+                                        match seg_source {
+                                            SegmentSource::Mic => self.mic_window_votes += 1,
+                                            SegmentSource::System => self.sys_window_votes += 1,
+                                            SegmentSource::Mixed => {}
+                                        }
+                                    }
+                                    if !speech_segments.is_empty() {
+                                        // A segment spans many windows; tag it by which
+                                        // channel dominated across all of them, not just
+                                        // whichever window happened to close it out.
+                                        let segment_tag = self.take_segment_source();
+                                        for segment in speech_segments {
+                                            let duration_ms = segment.end_timestamp_ms - segment.start_timestamp_ms;
 
-                                        if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
-                                            info!("📤 Sending VAD segment: {:.1}ms, {} samples",
-                                                  duration_ms, segment.samples.len());
+                                            if segment.samples.len() >= 800 {  // Minimum 50ms at 16kHz - matches Parakeet capability
+                                                info!("📤 Sending VAD segment: {:.1}ms, {} samples, tag={:?}",
+                                                      duration_ms, segment.samples.len(), segment_tag);
 
-                                            let transcription_chunk = AudioChunk {
-                                                data: segment.samples,
-                                                sample_rate: 16000,
-                                                timestamp: segment.start_timestamp_ms / 1000.0,
-                                                chunk_id: self.chunk_id_counter,
-                                                device_type: DeviceType::Microphone,  // Mixed audio
-                                            };
+                                                let transcription_chunk = AudioChunk {
+                                                    data: segment.samples,
+                                                    sample_rate: 16000,
+                                                    timestamp: segment.start_timestamp_ms / 1000.0,
+                                                    chunk_id: self.chunk_id_counter,
+                                                    device_type: DeviceType::Microphone,  // Mixed audio
+                                                    segment_source: segment_tag,
+                                                };
 
-                                            if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                                                warn!("Failed to send VAD segment: {}", e);
+                                                if let Err(e) = self.transcription_sender.send(transcription_chunk) {
+                                                    warn!("Failed to send VAD segment: {}", e);
+                                                } else {
+                                                    self.chunk_id_counter += 1;
+                                                }
                                             } else {
-                                                self.chunk_id_counter += 1;
+                                                debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
+                                                       duration_ms, segment.samples.len());
                                             }
-                                        } else {
-                                            debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
-                                                   duration_ms, segment.samples.len());
                                         }
                                     }
                                 }
@@ -873,6 +924,7 @@ impl AudioPipeline {
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,
                                     device_type: DeviceType::Microphone,  // Mixed audio
+                                    segment_source: seg_source,
                                 };
                                 let _ = sender.send(recording_chunk);
                             }
@@ -917,6 +969,9 @@ impl AudioPipeline {
                             timestamp: segment.start_timestamp_ms / 1000.0,
                             chunk_id: self.chunk_id_counter,
                             device_type: DeviceType::Microphone,
+                            // Majority vote across whatever windows accumulated
+                            // since the last completed segment.
+                            segment_source: self.take_segment_source(),
                         };
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {
@@ -936,6 +991,50 @@ impl AudioPipeline {
         }
 
         Ok(())
+    }
+
+    /// Majority vote across the windows tallied since the last completed
+    /// segment (see `mic_window_votes`/`sys_window_votes`), then resets the
+    /// tally for the next segment. A tie, including no windows tallied at
+    /// all, falls back to the most recent window's own tag.
+    fn take_segment_source(&mut self) -> SegmentSource {
+        let source = if self.mic_window_votes > self.sys_window_votes {
+            SegmentSource::Mic
+        } else if self.sys_window_votes > self.mic_window_votes {
+            SegmentSource::System
+        } else {
+            self.last_segment_source
+        };
+        info!(
+            "🗳️ Segment vote tally: mic={} sys={} -> {:?}",
+            self.mic_window_votes, self.sys_window_votes, source
+        );
+        self.mic_window_votes = 0;
+        self.sys_window_votes = 0;
+        source
+    }
+
+    /// Tags which channel dominated this window; see `tag_dominant` for why
+    /// this compares each channel's RMS to its own recent average rather
+    /// than comparing mic and system RMS to each other directly.
+    fn tag_dominant_source(&mut self, mic: &[f32], sys: &[f32]) -> SegmentSource {
+        let (m, s) = (rms(mic), rms(sys));
+        let seg_source = tag_dominant(mic, sys, &mut self.mic_rms_floor, &mut self.sys_rms_floor);
+        let mic_elevation = m / self.mic_rms_floor.max(1e-6);
+        let sys_elevation = s / self.sys_rms_floor.max(1e-6);
+
+        perf_trace!(
+            "tag_dominant_source: mic_rms={:.5} floor={:.5} x{:.2} | sys_rms={:.5} floor={:.5} x{:.2} -> {:?}",
+            m, self.mic_rms_floor, mic_elevation, s, self.sys_rms_floor, sys_elevation, seg_source
+        );
+        if seg_source != self.last_segment_source {
+            info!(
+                "🏷️ Segment source: {:?} -> {:?} (mic x{:.2} floor, sys x{:.2} floor)",
+                self.last_segment_source, seg_source, mic_elevation, sys_elevation
+            );
+        }
+
+        seg_source
     }
 
 }
@@ -1039,6 +1138,7 @@ impl AudioPipelineManager {
                 timestamp: 0.0,
                 chunk_id: u64::MAX, // Special ID to indicate flush
                 device_type: super::recording_state::DeviceType::Microphone,
+                segment_source: SegmentSource::Mixed,
             };
 
             if let Err(e) = sender.send(flush_chunk) {
@@ -1059,6 +1159,7 @@ impl AudioPipelineManager {
                         timestamp: 0.0,
                         chunk_id: u64::MAX - (i as u64),
                         device_type: super::recording_state::DeviceType::Microphone,
+                        segment_source: SegmentSource::Mixed,
                     };
                     let _ = sender.send(additional_flush);
                 }
@@ -1076,5 +1177,160 @@ impl AudioPipelineManager {
 impl Default for AudioPipelineManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() { return 0.0; }
+    (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
+/// Mic wins or system wins only when clearly elevated (2x) above its own
+/// recent average; else Mixed. Mic audio is EBU R128 loudness-normalized
+/// toward a fixed -23 LUFS target before it ever reaches this pipeline (see
+/// AudioCapture's normalizer); system audio stays raw. Comparing absolute
+/// RMS directly always favors mic, even when the mic only picked up its own
+/// noise floor, because the normalizer boosts that floor toward the same
+/// target every window. Comparing each channel's RMS against its own
+/// slow-moving average instead finds the channel with something happening
+/// on it right now, regardless of which channel runs louder overall.
+/// `mic_floor`/`sys_floor` carry that average across calls.
+fn tag_dominant(mic: &[f32], sys: &[f32], mic_floor: &mut f32, sys_floor: &mut f32) -> SegmentSource {
+    let (m, s) = (rms(mic), rms(sys));
+
+    const FLOOR_ALPHA: f32 = 0.02;
+    // True silence decays a floor toward zero. The very next window with
+    // even faint residual noise then divides into a runaway "elevation"
+    // (a floor updated to 0.02x the current RMS makes the ratio ~50x by
+    // construction, not because anything real happened) and wins the
+    // dominance compare on cold-start noise alone. Clamping the floor to a
+    // small fixed minimum keeps the ratio meaningful: a channel only reads
+    // as elevated once it is genuinely loud relative to typical noise, not
+    // merely nonzero relative to a floor that hasn't caught up yet.
+    const MIN_FLOOR: f32 = 0.001;
+    *mic_floor = (*mic_floor * (1.0 - FLOOR_ALPHA) + m * FLOOR_ALPHA).max(MIN_FLOOR);
+    *sys_floor = (*sys_floor * (1.0 - FLOOR_ALPHA) + s * FLOOR_ALPHA).max(MIN_FLOOR);
+
+    let mic_elevation = m / *mic_floor;
+    let sys_elevation = s / *sys_floor;
+
+    // Comparing the two elevations to each other isn't enough on its own: a
+    // channel that just finished a loud passage leaves its floor inflated,
+    // so it reads BELOW its own floor (elevation under 1.0) right after -
+    // and "below 1.0" can still be larger than the other, equally quiet,
+    // channel's near-zero reading. Requiring genuine elevation above a
+    // channel's own baseline, not just a ratio win, keeps that undershoot
+    // from being mistaken for the other channel suddenly dominating.
+    const DOMINANCE_RATIO: f32 = 2.0;
+    const MIN_ELEVATION: f32 = 1.5;
+    let mic_dominant = mic_elevation > MIN_ELEVATION && mic_elevation > sys_elevation * DOMINANCE_RATIO;
+    let sys_dominant = sys_elevation > MIN_ELEVATION && sys_elevation > mic_elevation * DOMINANCE_RATIO;
+
+    if mic_dominant { SegmentSource::Mic }
+    else if sys_dominant { SegmentSource::System }
+    else { SegmentSource::Mixed }
+}
+
+#[cfg(test)]
+mod source_tag_tests {
+    use super::*;
+
+    fn tone(amplitude: f32) -> Vec<f32> {
+        (0..1600).map(|i| ((i as f32) * 0.1).sin() * amplitude).collect()
+    }
+
+    /// Settles both floors on a steady quiet baseline over several windows,
+    /// as a real session would within the first couple of seconds.
+    fn settle(mic_floor: &mut f32, sys_floor: &mut f32, mic_base: f32, sys_base: f32) {
+        for _ in 0..200 {
+            tag_dominant(&tone(mic_base), &tone(sys_base), mic_floor, sys_floor);
+        }
+    }
+
+    #[test]
+    fn loud_system_tags_system_even_when_quieter_in_absolute_terms() {
+        // Models the real defect: mic is normalized toward a fixed loud
+        // target (steady 0.20 baseline, standing in for boosted noise
+        // floor), system runs much quieter overall (0.02 baseline, raw and
+        // unboosted). A straight RMS compare would tag every window Mic
+        // forever. Once system goes clearly above ITS OWN baseline, even
+        // though it's still far below mic's absolute level, it must tag
+        // System.
+        let (mut mic_floor, mut sys_floor) = (0.0, 0.0);
+        settle(&mut mic_floor, &mut sys_floor, 0.20, 0.02);
+        assert!(mic_floor > sys_floor, "the scenario requires mic to run louder in absolute terms");
+
+        let seg = tag_dominant(&tone(0.20), &tone(0.10), &mut mic_floor, &mut sys_floor);
+        assert_eq!(seg, SegmentSource::System);
+    }
+
+    #[test]
+    fn loud_mic_tags_mic() {
+        let (mut mic_floor, mut sys_floor) = (0.0, 0.0);
+        settle(&mut mic_floor, &mut sys_floor, 0.05, 0.05);
+
+        let seg = tag_dominant(&tone(0.5), &tone(0.05), &mut mic_floor, &mut sys_floor);
+        assert_eq!(seg, SegmentSource::Mic);
+    }
+
+    #[test]
+    fn both_at_their_usual_level_is_mixed() {
+        let (mut mic_floor, mut sys_floor) = (0.0, 0.0);
+        settle(&mut mic_floor, &mut sys_floor, 0.20, 0.02);
+
+        let seg = tag_dominant(&tone(0.20), &tone(0.02), &mut mic_floor, &mut sys_floor);
+        assert_eq!(seg, SegmentSource::Mixed);
+    }
+
+    /// Models what a fresh recording actually looks like: both floors start
+    /// at true zero (no settle period), several windows of near-silence
+    /// pass, then a loud clip plays on the system side. Before the floor
+    /// was clamped to a minimum, the floor update on that very first
+    /// near-silent window made mic's own residual noise divide into a
+    /// spurious ~50x "elevation" and win, even though nothing was actually
+    /// happening on the mic. This is the exact sequence QA hit live.
+    #[test]
+    fn cold_start_silence_does_not_falsely_win_before_real_signal_arrives() {
+        let (mut mic_floor, mut sys_floor) = (0.0, 0.0);
+        let silence = tone(0.0003); // digital noise floor, not real signal
+
+        for _ in 0..20 {
+            let seg = tag_dominant(&silence, &silence, &mut mic_floor, &mut sys_floor);
+            assert_eq!(
+                seg,
+                SegmentSource::Mixed,
+                "near-silence must never win dominance on cold-start floor math alone"
+            );
+        }
+
+        let seg = tag_dominant(&tone(0.20), &silence, &mut mic_floor, &mut sys_floor);
+        assert_eq!(seg, SegmentSource::Mic, "a genuinely loud window must still win");
+    }
+
+    /// Models the other live failure: system plays loud, pulling its own
+    /// floor up, then stops. The very next window reads system as BELOW its
+    /// (now inflated) floor - elevation under 1.0 - while mic sits at its
+    /// untouched normal baseline the whole time. Comparing the two
+    /// elevations to each other alone let that undershoot "win" as Mic
+    /// merely for being less far under 1.0 than system. Neither channel did
+    /// anything unusual on mic's part, so this must read Mixed.
+    #[test]
+    fn undershoot_after_a_loud_passage_does_not_falsely_win_the_other_channel() {
+        let (mut mic_floor, mut sys_floor) = (0.0, 0.0);
+        settle(&mut mic_floor, &mut sys_floor, 0.05, 0.02);
+
+        // System plays loud for a stretch, well above its own baseline.
+        for _ in 0..30 {
+            tag_dominant(&tone(0.05), &tone(0.20), &mut mic_floor, &mut sys_floor);
+        }
+
+        // System stops abruptly; mic never changed from its own baseline.
+        let silence = tone(0.0001);
+        let seg = tag_dominant(&tone(0.05), &silence, &mut mic_floor, &mut sys_floor);
+        assert_eq!(
+            seg,
+            SegmentSource::Mixed,
+            "mic sitting at its own normal baseline must not be tagged dominant just because system undershot"
+        );
     }
 }

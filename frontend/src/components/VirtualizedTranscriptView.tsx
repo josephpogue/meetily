@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useReducer, startTransition, useEffect, useState, memo } from "react";
+import { useCallback, useRef, useReducer, startTransition, useEffect, useMemo, useState, memo } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useAutoScroll } from "@/hooks/useAutoScroll";
 import { useTranscriptStreaming } from "@/hooks/useTranscriptStreaming";
@@ -50,6 +50,15 @@ function formatRecordingTime(seconds: number | undefined): string {
     return `[${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}]`;
 }
 
+// Speaker label for a segment's dominant-channel source. "mixed" (or an
+// unknown/missing source) renders no label, since we can't attribute it to
+// a single speaker.
+function speakerLabelFor(source?: string): string | null {
+    if (source === 'mic') return 'You';
+    if (source === 'system') return 'Them';
+    return null;
+}
+
 // Helper function to remove filler words and repetitions
 function cleanStopWords(text: string): string {
     const stopWords = ['uh', 'um', 'er', 'ah', 'hmm', 'hm', 'eh', 'oh'];
@@ -71,6 +80,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence,
     isStreaming,
     showConfidence,
+    speakerLabel,
 }: {
     id: string;
     timestamp: number;
@@ -78,11 +88,19 @@ const TranscriptSegment = memo(function TranscriptSegment({
     confidence?: number;
     isStreaming: boolean;
     showConfidence: boolean;
+    speakerLabel?: string | null;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
     return (
         <div id={`segment-${id}`} className="mb-3">
+            {speakerLabel && (
+                <div className="mb-1 pl-[58px]">
+                    <span className="inline-flex items-center rounded-full bg-gray-100 px-2 py-0.5 text-[11px] font-medium text-gray-500">
+                        {speakerLabel}
+                    </span>
+                </div>
+            )}
             <div className="flex items-start gap-2">
                 <Tooltip>
                     <TooltipTrigger>
@@ -162,6 +180,13 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
         segments,
         isRecording,
         enableStreaming
+    );
+
+    // Group consecutive same-source segments so the speaker label only
+    // appears once per group, at the top, instead of on every line.
+    const groupStarts = useMemo(
+        () => segments.map((segment, index) => index === 0 || segments[index - 1].source !== segment.source),
+        [segments]
     );
 
     // Infinite scroll: IntersectionObserver to trigger loading more
@@ -296,6 +321,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speakerLabel={groupStarts[virtualRow.index] ? speakerLabelFor(segment.source) : null}
                                     />
                                 </div>
                             );
@@ -335,7 +361,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                 // Simple rendering for small lists (better animations)
                 <>
                     <div className="space-y-1">
-                        {segments.map((segment) => {
+                        {segments.map((segment, index) => {
                             const isStreaming = streamingSegmentId === segment.id;
 
                             return (
@@ -352,6 +378,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         confidence={segment.confidence}
                                         isStreaming={isStreaming}
                                         showConfidence={showConfidence}
+                                        speakerLabel={groupStarts[index] ? speakerLabelFor(segment.source) : null}
                                     />
                                 </motion.div>
                             );

@@ -37,6 +37,7 @@ pub(crate) use perf_trace;
 // Declare audio module
 pub mod analytics;
 pub mod api;
+pub mod assistant;
 pub mod audio;
 pub mod config;
 pub mod console_utils;
@@ -411,12 +412,52 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        return;
+                    }
+                    let handle = app.state::<assistant::AssistantHandle>().inner().clone();
+                    if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyA,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::voice_toggle(&handle).await;
+                        });
+                    } else if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyE,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::explain(&handle).await;
+                        });
+                    } else if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyC,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::catchup(&handle).await;
+                        });
+                    } else if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyM,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::cycle_mode(&handle).await;
+                        });
+                    }
+                })
+                .build(),
+        )
         .manage(whisper_engine::parallel_commands::ParallelProcessorState::new())
         .manage(Arc::new(RwLock::new(
             None::<notifications::manager::NotificationManager<tauri::Wry>>,
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
+        .manage(assistant::AssistantHandle::new())
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -507,6 +548,42 @@ pub fn run() {
                 summary::templates::set_bundled_templates_dir(templates_dir);
             } else {
                 log::warn!("Failed to resolve resource directory for templates");
+            }
+
+            // Wire the live meeting assistant: transcript-update /
+            // recording-started / recording-stopped listeners, trigger
+            // engine, answer lanes, voice ask. Never blocks setup; failures
+            // land in assistant-status, not here.
+            assistant::core::install(_app.handle().clone());
+
+            // Global hotkeys for the assistant, unfocused-app included:
+            // Option-A voice ask toggle, Option-E explain, Option-C catch-up,
+            // Option-M cycle mode. A failed registration (for example the
+            // combo is already owned by another app) just logs and moves on;
+            // every one of these actions also has a button in the panel.
+            use tauri_plugin_global_shortcut::GlobalShortcutExt;
+            let hotkeys = [
+                ("voice ask toggle (Option-A)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyA,
+                )),
+                ("explain (Option-E)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyE,
+                )),
+                ("catch-up (Option-C)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyC,
+                )),
+                ("cycle mode (Option-M)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyM,
+                )),
+            ];
+            for (label, shortcut) in hotkeys {
+                if let Err(e) = _app.global_shortcut().register(shortcut) {
+                    log::warn!("assistant: could not register the {} global hotkey: {}", label, e);
+                }
             }
 
             Ok(())
@@ -748,6 +825,24 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Assistant commands
+            assistant::assistant_get_settings,
+            assistant::assistant_save_settings,
+            assistant::assistant_test_claude,
+            assistant::commands::assistant_get_state,
+            assistant::commands::assistant_set_enabled,
+            assistant::commands::assistant_ask,
+            assistant::commands::assistant_explain,
+            assistant::commands::assistant_catchup,
+            assistant::commands::assistant_set_mode,
+            assistant::commands::assistant_set_listening,
+            assistant::commands::assistant_voice_start,
+            assistant::commands::assistant_voice_finish,
+            assistant::commands::assistant_voice_cancel,
+            assistant::commands::assistant_draft_note,
+            assistant::commands::assistant_save_note,
+            assistant::commands::assistant_discard_note,
+            assistant::commands::assistant_set_brief,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

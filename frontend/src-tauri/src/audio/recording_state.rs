@@ -14,6 +14,16 @@ pub enum DeviceType {
     System,
 }
 
+/// Which channel dominated a mixed audio window, before the mixer erases identity.
+/// `Mixed` means neither channel was clearly louder (or the tag was never computed).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SegmentSource {
+    Mic,
+    System,
+    #[default]
+    Mixed,
+}
+
 /// Audio chunk with metadata for processing
 #[derive(Debug, Clone)]
 pub struct AudioChunk {
@@ -22,6 +32,7 @@ pub struct AudioChunk {
     pub timestamp: f64,
     pub chunk_id: u64,
     pub device_type: DeviceType,
+    pub segment_source: SegmentSource,
 }
 
 /// Processed audio chunk (post-VAD) for recording

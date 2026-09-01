@@ -71,10 +71,12 @@ export class RecordingService {
     systemDeviceName: string | null,
     meetingName: string
   ): Promise<void> {
+    // Tauri v2 renames command arguments to camelCase, so snake_case keys here
+    // deserialize as None and silently drop the devices and the meeting name.
     return invoke('start_recording_with_devices_and_meeting', {
-      mic_device_name: micDeviceName,
-      system_device_name: systemDeviceName,
-      meeting_name: meetingName
+      micDeviceName,
+      systemDeviceName,
+      meetingName
     });
   }
 
