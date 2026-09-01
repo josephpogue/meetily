@@ -7,6 +7,7 @@
 
 pub mod card;
 pub mod claude_cli;
+pub mod lanes;
 pub mod settings;
 pub mod transcript;
 pub mod trigger;
