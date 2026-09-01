@@ -82,6 +82,15 @@ impl ContinuousVadProcessor {
         })
     }
 
+    /// Whether the audio just passed to `process_audio` landed inside an
+    /// active speech run (post pre-speech-pad onset, pre redemption-time
+    /// silence tail). Callers use this to tell a window that is genuinely
+    /// part of the current utterance from ambient noise between utterances,
+    /// which VAD's own model rejects far better than a plain energy check.
+    pub fn is_in_speech(&self) -> bool {
+        self.in_speech
+    }
+
     /// Process incoming audio samples and return any complete speech segments
     /// Handles resampling from input sample rate to 16kHz for VAD processing
     pub fn process_audio(&mut self, samples: &[f32]) -> Result<Vec<SpeechSegment>> {

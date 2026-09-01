@@ -850,11 +850,6 @@ impl AudioPipeline {
                             // Tag which channel dominated this window before the mixer erases identity
                             let seg_source = self.tag_dominant_source(&mic_window, &sys_window);
                             self.last_segment_source = seg_source;
-                            match seg_source {
-                                SegmentSource::Mic => self.mic_window_votes += 1,
-                                SegmentSource::System => self.sys_window_votes += 1,
-                                SegmentSource::Mixed => {}
-                            }
 
                             // Simple mixing without aggressive ducking
                             let mixed_clean = self.mixer.mix_window(&mic_window, &sys_window);
@@ -868,6 +863,21 @@ impl AudioPipeline {
                             // STEP 3: Send mixed audio for transcription (VAD + Whisper)
                             match self.vad_processor.process_audio(&mixed_with_gain) {
                                 Ok(speech_segments) => {
+                                    // Only a window VAD just accepted into the current
+                                    // speech run gets a vote. A vote cast on every window
+                                    // regardless of VAD state lets minutes of ambient
+                                    // room noise between utterances (near-guaranteed to
+                                    // tip mic-dominant at some point) outvote the much
+                                    // shorter genuinely-dominant speech itself. VAD's own
+                                    // model rejects that noise far better than an energy
+                                    // threshold on our end would.
+                                    if self.vad_processor.is_in_speech() {
+                                        match seg_source {
+                                            SegmentSource::Mic => self.mic_window_votes += 1,
+                                            SegmentSource::System => self.sys_window_votes += 1,
+                                            SegmentSource::Mixed => {}
+                                        }
+                                    }
                                     if !speech_segments.is_empty() {
                                         // A segment spans many windows; tag it by which
                                         // channel dominated across all of them, not just
@@ -995,6 +1005,10 @@ impl AudioPipeline {
         } else {
             self.last_segment_source
         };
+        info!(
+            "🗳️ Segment vote tally: mic={} sys={} -> {:?}",
+            self.mic_window_votes, self.sys_window_votes, source
+        );
         self.mic_window_votes = 0;
         self.sys_window_votes = 0;
         source
