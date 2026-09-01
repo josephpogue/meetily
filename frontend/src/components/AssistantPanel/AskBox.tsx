@@ -13,10 +13,11 @@ interface AskBoxProps {
 /**
  * Typed ask input pinned at the bottom of the panel, plus the voice ask mic
  * button. Mic click starts capture; a second click submits what was heard.
- * Escape cancels an in-progress capture.
+ * Escape cancels an in-progress capture (handled panel-wide in AssistantPanel,
+ * so it works whether or not this input has focus).
  */
 export function AskBox({ disabled }: AskBoxProps) {
-  const { ask, voice, voiceStart, voiceFinish, voiceCancel } = useAssistant();
+  const { ask, voice, voiceStart, voiceFinish } = useAssistant();
   const [value, setValue] = useState('');
 
   const submit = () => {
@@ -30,9 +31,6 @@ export function AskBox({ disabled }: AskBoxProps) {
     if (e.key === 'Enter') {
       e.preventDefault();
       submit();
-    } else if (e.key === 'Escape' && voice.state === 'listening') {
-      e.preventDefault();
-      voiceCancel();
     }
   };
 

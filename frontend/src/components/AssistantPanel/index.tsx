@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   AlertCircle,
@@ -37,16 +37,35 @@ export function AssistantPanel() {
     status,
     cards,
     note,
+    voice,
     setEnabled,
     setListening,
     setMode,
     explain,
     catchup,
     setBrief,
+    voiceCancel,
   } = useAssistant();
 
   const [collapsed, setCollapsed] = useState(false);
   const [briefValue, setBriefValue] = useState('');
+
+  // Escape cancels an in-progress voice capture, regardless of what has
+  // focus. Only attached while actually listening, so it's never a global
+  // key grab and never swallows Escape (modals, etc.) when voice is off.
+  useEffect(() => {
+    if (voice.state !== 'listening') return;
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        voiceCancel();
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [voice.state, voiceCancel]);
 
   if (collapsed) {
     return (
