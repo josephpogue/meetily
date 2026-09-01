@@ -412,6 +412,45 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, shortcut, event| {
+                    if event.state() != tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        return;
+                    }
+                    let handle = app.state::<assistant::AssistantHandle>().inner().clone();
+                    if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyA,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::voice_toggle(&handle).await;
+                        });
+                    } else if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyE,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::explain(&handle).await;
+                        });
+                    } else if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyC,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::catchup(&handle).await;
+                        });
+                    } else if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyM,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::cycle_mode(&handle).await;
+                        });
+                    }
+                })
+                .build(),
+        )
         .manage(whisper_engine::parallel_commands::ParallelProcessorState::new())
         .manage(Arc::new(RwLock::new(
             None::<notifications::manager::NotificationManager<tauri::Wry>>,
@@ -516,6 +555,36 @@ pub fn run() {
             // engine, answer lanes, voice ask. Never blocks setup; failures
             // land in assistant-status, not here.
             assistant::core::install(_app.handle().clone());
+
+            // Global hotkeys for the assistant, unfocused-app included:
+            // Option-A voice ask toggle, Option-E explain, Option-C catch-up,
+            // Option-M cycle mode. A failed registration (for example the
+            // combo is already owned by another app) just logs and moves on;
+            // every one of these actions also has a button in the panel.
+            use tauri_plugin_global_shortcut::GlobalShortcutExt;
+            let hotkeys = [
+                ("voice ask toggle (Option-A)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyA,
+                )),
+                ("explain (Option-E)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyE,
+                )),
+                ("catch-up (Option-C)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyC,
+                )),
+                ("cycle mode (Option-M)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyM,
+                )),
+            ];
+            for (label, shortcut) in hotkeys {
+                if let Err(e) = _app.global_shortcut().register(shortcut) {
+                    log::warn!("assistant: could not register the {} global hotkey: {}", label, e);
+                }
+            }
 
             Ok(())
         })

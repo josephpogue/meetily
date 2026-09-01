@@ -274,16 +274,34 @@ pub async fn set_enabled(handle: &AssistantHandle, enabled: bool) {
     core.emit_status();
 }
 
-pub async fn set_mode(handle: &AssistantHandle, mode: &str) -> Result<(), String> {
-    let parsed = parse_mode(mode)?;
-    let mut core = handle.0.lock().await;
-    core.mode = parsed;
+/// Shared by `set_mode` (explicit, from the settings UI) and `cycle_mode`
+/// (the Option-M hotkey): applies a mode, rebuilds the trigger engine's
+/// config from it, and emits status. Caller already holds the lock.
+fn apply_mode(core: &mut AssistantCore, mode: TriggerMode) {
+    core.mode = mode;
     let names = split_names(&core.settings.names);
     let quiet_gap = core.settings.quiet_gap_secs;
     let listening = core.listening;
-    core.trigger.update(parsed, quiet_gap, listening, names);
+    core.trigger.update(mode, quiet_gap, listening, names);
     core.emit_status();
+}
+
+pub async fn set_mode(handle: &AssistantHandle, mode: &str) -> Result<(), String> {
+    let parsed = parse_mode(mode)?;
+    let mut core = handle.0.lock().await;
+    apply_mode(&mut core, parsed);
     Ok(())
+}
+
+/// Option-M: manual -> gated -> continuous -> manual.
+pub async fn cycle_mode(handle: &AssistantHandle) {
+    let mut core = handle.0.lock().await;
+    let next = match core.mode {
+        TriggerMode::Manual => TriggerMode::Gated,
+        TriggerMode::Gated => TriggerMode::Continuous,
+        TriggerMode::Continuous => TriggerMode::Manual,
+    };
+    apply_mode(&mut core, next);
 }
 
 pub async fn set_listening(handle: &AssistantHandle, listening: bool) {
@@ -344,6 +362,17 @@ pub async fn voice_finish(handle: &AssistantHandle) {
 
 pub async fn voice_cancel(handle: &AssistantHandle) {
     handle.0.lock().await.voice.cancel();
+}
+
+/// Option-A: start if idle, finish if capturing. Checked and acted on under
+/// one lock so two presses close together can't both see "idle".
+pub async fn voice_toggle(handle: &AssistantHandle) {
+    let mut core = handle.0.lock().await;
+    if core.voice.is_capturing() {
+        core.voice.finish();
+    } else {
+        core.voice.start();
+    }
 }
 
 pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
