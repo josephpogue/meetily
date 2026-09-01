@@ -5,6 +5,7 @@
 // transcription; every entry point here must catch its own errors so an
 // assistant failure never touches the recording path.
 
+pub mod claude_cli;
 pub mod settings;
 
 use std::sync::Arc;
