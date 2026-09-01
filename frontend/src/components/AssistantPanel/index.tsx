@@ -15,6 +15,7 @@ import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useAssistant } from '@/contexts/AssistantContext';
+import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { AssistantCard } from './AssistantCard';
 import { AskBox } from './AskBox';
 import { NoteBar } from './NoteBar';
@@ -46,9 +47,19 @@ export function AssistantPanel() {
     setBrief,
     voiceCancel,
   } = useAssistant();
+  const { isRecording } = useRecordingState();
 
   const [collapsed, setCollapsed] = useState(false);
   const [briefValue, setBriefValue] = useState('');
+
+  // Tracks whether a recording has actually run this panel's lifetime, so the
+  // end-of-meeting note bar can appear after that recording stops even when
+  // no cards were ever generated. Local, not backend-derived: status.sessionOpen
+  // is not a reliable signal for this yet.
+  const [hasRecorded, setHasRecorded] = useState(false);
+  useEffect(() => {
+    if (isRecording) setHasRecorded(true);
+  }, [isRecording]);
 
   // Escape cancels an in-progress voice capture, regardless of what has
   // focus. Only attached while actually listening, so it's never a global
@@ -181,7 +192,7 @@ export function AssistantPanel() {
         )}
       </div>
 
-      {(!status.sessionOpen && cards.length > 0) || note.state !== 'idle' ? <NoteBar /> : null}
+      {(status.enabled && hasRecorded && !isRecording) || note.state !== 'idle' ? <NoteBar /> : null}
 
       <div className="flex gap-2 border-t border-gray-200 p-3">
         <Button
