@@ -37,6 +37,7 @@ pub(crate) use perf_trace;
 // Declare audio module
 pub mod analytics;
 pub mod api;
+pub mod assistant;
 pub mod audio;
 pub mod config;
 pub mod console_utils;
@@ -417,6 +418,7 @@ pub fn run() {
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
+        .manage(assistant::AssistantHandle::new())
         .setup(|_app| {
             log::info!("Application setup complete");
 
@@ -748,6 +750,10 @@ pub fn run() {
             audio::import::start_import_audio_command,
             audio::import::cancel_import_command,
             audio::import::is_import_in_progress_command,
+            // Assistant commands
+            assistant::assistant_get_settings,
+            assistant::assistant_save_settings,
+            assistant::assistant_test_claude,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

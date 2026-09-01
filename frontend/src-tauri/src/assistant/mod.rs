@@ -1,0 +1,66 @@
+// assistant/mod.rs
+//
+// The live meeting assistant: claude CLI runner, answer lanes, trigger engine,
+// voice ask, note drafter, Tauri commands. Fully isolated from recording and
+// transcription; every entry point here must catch its own errors so an
+// assistant failure never touches the recording path.
+
+pub mod settings;
+
+use std::sync::Arc;
+use tauri::State;
+use tokio::sync::Mutex;
+
+pub use settings::{AssistantSettings, ClaudeProbe};
+
+use crate::state::AppState;
+
+/// Assistant state. Filled in across later tasks: transcript log, trigger
+/// engine, answer lanes, voice ask and note flow all land here.
+#[derive(Default)]
+pub struct AssistantCore {
+    pub settings: AssistantSettings,
+}
+
+#[derive(Clone)]
+pub struct AssistantHandle(pub Arc<Mutex<AssistantCore>>);
+
+impl AssistantHandle {
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(AssistantCore::default())))
+    }
+}
+
+impl Default for AssistantHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[tauri::command]
+pub async fn assistant_get_settings(
+    state: State<'_, AppState>,
+) -> Result<AssistantSettings, String> {
+    AssistantSettings::load(state.db_manager.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn assistant_save_settings(
+    state: State<'_, AppState>,
+    settings: AssistantSettings,
+) -> Result<(), String> {
+    settings
+        .save(state.db_manager.pool())
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn assistant_test_claude(state: State<'_, AppState>) -> Result<ClaudeProbe, String> {
+    let settings = AssistantSettings::load(state.db_manager.pool())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(settings::probe_claude(&settings).await)
+}
