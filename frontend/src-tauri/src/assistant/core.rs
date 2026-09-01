@@ -80,6 +80,11 @@ pub struct AssistantCore {
     trigger: TriggerEngine,
     lanes: AnswerLanes,
     voice: VoiceAsk,
+    /// The open You-utterance's text at the moment voice-ask's hotkey was
+    /// pressed, if any. Stripped as a prefix from transcript text fed to
+    /// `voice` so speech from before the press does not bleed into the
+    /// captured question.
+    voice_baseline: String,
 
     app: Option<AppHandle<Wry>>,
     /// Built once in `install`; every settled card reaches the panel and,
@@ -120,6 +125,7 @@ impl Default for AssistantCore {
             // an empty path just fails fast if ever invoked before that.
             lanes: AnswerLanes::new(claude_runner(PathBuf::new())),
             voice: VoiceAsk::new(|_| {}, |_| {}),
+            voice_baseline: String::new(),
             app: None,
             card_emit: Arc::new(|_| {}),
             qa_log: Arc::new(StdMutex::new(Vec::new())),
@@ -364,7 +370,9 @@ pub async fn catchup(handle: &AssistantHandle) {
 }
 
 pub async fn voice_start(handle: &AssistantHandle) {
-    handle.0.lock().await.voice.start();
+    let mut core = handle.0.lock().await;
+    core.voice_baseline = core.transcript.open_you_preview();
+    core.voice.start();
 }
 
 pub async fn voice_finish(handle: &AssistantHandle) {
@@ -382,6 +390,7 @@ pub async fn voice_toggle(handle: &AssistantHandle) {
     if core.voice.is_capturing() {
         core.voice.finish();
     } else {
+        core.voice_baseline = core.transcript.open_you_preview();
         core.voice.start();
     }
 }
@@ -470,6 +479,21 @@ pub async fn discard_note(handle: &AssistantHandle) {
     core.emit_note();
 }
 
+/// Removes a previously-captured baseline prefix (the open utterance's text
+/// as it stood when voice-ask's hotkey was pressed) from freshly-ingested
+/// transcript text. A mismatched or empty baseline passes `text` through
+/// unchanged, which is what a fresh utterance started after the press
+/// should do.
+fn strip_voice_baseline(baseline: &str, text: &str) -> String {
+    if baseline.is_empty() {
+        return text.to_string();
+    }
+    match text.strip_prefix(baseline) {
+        Some(rest) => rest.trim_start().to_string(),
+        None => text.to_string(),
+    }
+}
+
 async fn on_transcript_update(handle: &AssistantHandle, update: TranscriptUpdate) {
     let mut core = handle.0.lock().await;
     if !core.enabled || !core.session_open {
@@ -491,7 +515,8 @@ async fn on_transcript_update(handle: &AssistantHandle, update: TranscriptUpdate
         match out {
             AssemblerOut::Running { speaker, text } => {
                 if speaker == Speaker::You && core.voice.is_capturing() {
-                    core.voice.note_running(&text);
+                    let voice_text = strip_voice_baseline(&core.voice_baseline, &text);
+                    core.voice.note_running(&voice_text);
                 }
                 core.trigger.consume_running(speaker, &text);
             }
@@ -501,7 +526,12 @@ async fn on_transcript_update(handle: &AssistantHandle, update: TranscriptUpdate
                     speaker, text.len()
                 );
                 if speaker == Speaker::You && core.voice.is_capturing() {
-                    core.voice.note_utterance(&text);
+                    let voice_text = strip_voice_baseline(&core.voice_baseline, &text);
+                    core.voice.note_utterance(&voice_text);
+                    // The utterance the baseline was measured against just
+                    // closed; anything after this is a fresh utterance the
+                    // baseline should not touch.
+                    core.voice_baseline.clear();
                 }
                 core.trigger.consume_utterance(speaker, &text);
             }
@@ -802,6 +832,40 @@ mod tests {
         let (text, cursor) = core.transcript.delta_since(0);
         assert_eq!(text, "");
         assert_eq!(cursor, 0);
+    }
+
+    /// Reproduces the leading-text bleed: speech happens, merges into an
+    /// open You utterance, then the hotkey is pressed mid-utterance. What
+    /// voice-ask hears must start at the press, not at the utterance's
+    /// start.
+    #[tokio::test]
+    async fn voice_ask_excludes_speech_from_before_the_hotkey() {
+        let handle = AssistantHandle::new();
+        let published = Arc::new(StdMutex::new(Vec::new()));
+        let published_clone = published.clone();
+        {
+            let mut core = handle.0.lock().await;
+            core.enabled = true;
+            core.session_open = true;
+            core.voice = VoiceAsk::new(
+                |_q: String| {},
+                move |s: VoiceState| published_clone.lock().unwrap().push(s),
+            );
+        }
+
+        // Spoken before the hotkey; merges into the open You utterance.
+        on_transcript_update(&handle, tu("mic", "Okay.", 0.0, 0.5)).await;
+
+        voice_start(&handle).await;
+
+        // Same utterance continues (same speaker, well inside the 1.2s gap).
+        on_transcript_update(&handle, tu("mic", "let's talk about the roadmap", 0.6, 2.0)).await;
+
+        let heard = match published.lock().unwrap().last().cloned() {
+            Some(VoiceState::Listening { heard }) => heard,
+            other => panic!("expected Listening, got {:?}", other),
+        };
+        assert_eq!(heard, "let's talk about the roadmap");
     }
 
     #[tokio::test]

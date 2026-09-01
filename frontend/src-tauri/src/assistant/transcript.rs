@@ -103,6 +103,17 @@ impl TranscriptLog {
         out
     }
 
+    /// Snapshot of the currently-open utterance's text, but only if it is
+    /// already attributed to `You`. Voice-ask calls this at hotkey-press
+    /// time to mark where an in-progress utterance stood, so speech spoken
+    /// before the press can be excluded from what voice-ask hears.
+    pub fn open_you_preview(&self) -> String {
+        match &self.open {
+            Some(open) if open.speaker == Speaker::You => self.preview_text(),
+            _ => String::new(),
+        }
+    }
+
     fn preview_text(&self) -> String {
         let Some(open) = &self.open else {
             return String::new();
@@ -347,5 +358,32 @@ mod tests {
 
         let out = log.window(15.0, Some(Speaker::Them));
         assert_eq!(out, "Them: committed");
+    }
+
+    /// Voice-ask reads this at hotkey-press time to mark where an
+    /// already-in-progress You utterance stood.
+    #[test]
+    fn open_you_preview_returns_the_in_progress_you_text() {
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("mic", "Okay.", 0.0, 1.0, false, 1));
+
+        assert_eq!(log.open_you_preview(), "Okay.");
+    }
+
+    /// A still-open utterance from the other side must not be mistaken for
+    /// pre-hotkey You speech.
+    #[test]
+    fn open_you_preview_is_empty_when_the_open_utterance_is_them() {
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("system", "hello", 0.0, 1.0, false, 1));
+
+        assert_eq!(log.open_you_preview(), "");
+    }
+
+    /// No speech at all yet.
+    #[test]
+    fn open_you_preview_is_empty_with_no_open_utterance() {
+        let log = TranscriptLog::default();
+        assert_eq!(log.open_you_preview(), "");
     }
 }
