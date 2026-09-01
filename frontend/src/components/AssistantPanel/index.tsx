@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   AlertCircle,
@@ -26,6 +26,10 @@ const MODE_LABELS: Record<(typeof MODE_ORDER)[number], string> = {
   gated: 'Gated',
   continuous: 'Continuous',
 };
+
+// How long a status.lastError (e.g. "nothing to explain yet") stays visible
+// before it clears on its own.
+const LAST_ERROR_DISPLAY_MS = 5000;
 
 /**
  * Assistant panel: sibling of TranscriptPanel in the main flex row.
@@ -60,6 +64,36 @@ export function AssistantPanel() {
   useEffect(() => {
     if (isRecording) setHasRecorded(true);
   }, [isRecording]);
+
+  // Quiet, transient status for status.lastError (e.g. Explain finding
+  // nothing on the Them channel yet): shows the backend's own message,
+  // then clears itself after a few seconds or as soon as a card lands.
+  const [lastErrorMessage, setLastErrorMessage] = useState<string | null>(null);
+  const clearLastErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    if (!status.lastError) return;
+
+    setLastErrorMessage(status.lastError);
+
+    if (clearLastErrorTimer.current) clearTimeout(clearLastErrorTimer.current);
+    clearLastErrorTimer.current = setTimeout(() => {
+      setLastErrorMessage(null);
+    }, LAST_ERROR_DISPLAY_MS);
+
+    return () => {
+      if (clearLastErrorTimer.current) clearTimeout(clearLastErrorTimer.current);
+    };
+  }, [status.lastError]);
+
+  const prevCardCountRef = useRef(cards.length);
+  useEffect(() => {
+    if (cards.length > prevCardCountRef.current) {
+      setLastErrorMessage(null);
+      if (clearLastErrorTimer.current) clearTimeout(clearLastErrorTimer.current);
+    }
+    prevCardCountRef.current = cards.length;
+  }, [cards.length]);
 
   // Escape cancels an in-progress voice capture, regardless of what has
   // focus. Only attached while actually listening, so it's never a global
@@ -193,6 +227,12 @@ export function AssistantPanel() {
       </div>
 
       {(status.enabled && hasRecorded && !isRecording) || note.state !== 'idle' ? <NoteBar /> : null}
+
+      {lastErrorMessage && (
+        <div className="border-t border-gray-200 px-3 py-2 text-center text-xs text-gray-400">
+          {lastErrorMessage}
+        </div>
+      )}
 
       <div className="flex gap-2 border-t border-gray-200 p-3">
         <Button
