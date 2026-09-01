@@ -11,6 +11,7 @@ pub mod lanes;
 pub mod settings;
 pub mod transcript;
 pub mod trigger;
+pub mod voice_ask;
 
 use std::sync::Arc;
 use tauri::State;
