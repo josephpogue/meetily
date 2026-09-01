@@ -9,6 +9,9 @@ import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
 import { toast } from 'sonner';
 
+// How long a sidebar auto-start request stays valid.
+const AUTO_START_MAX_AGE_MS = 15000;
+
 interface UseRecordingStartReturn {
   handleRecordingStart: () => Promise<void>;
   isAutoStarting: boolean;
@@ -147,11 +150,19 @@ export function useRecordingStart(
   useEffect(() => {
     const checkAutoStartRecording = async () => {
       if (typeof window !== 'undefined') {
-        const shouldAutoStart = sessionStorage.getItem('autoStartRecording');
-        if (shouldAutoStart === 'true' && !isRecording && !isAutoStarting) {
+        // The flag is a timestamp, and only counts for a few seconds after the
+        // sidebar set it. A bare 'true' could survive webview state restoration
+        // and auto-start a ghost recording on the next launch.
+        const flag = sessionStorage.getItem('autoStartRecording');
+        sessionStorage.removeItem('autoStartRecording'); // Single use, always
+        const requestedAt = flag ? Number(flag) : NaN;
+        const isFresh = Number.isFinite(requestedAt) && Date.now() - requestedAt < AUTO_START_MAX_AGE_MS;
+        if (flag && !isFresh) {
+          console.log('Ignoring a stale autoStartRecording flag:', flag);
+        }
+        if (isFresh && !isRecording && !isAutoStarting) {
           console.log('Auto-starting recording from navigation...');
           setIsAutoStarting(true);
-          sessionStorage.removeItem('autoStartRecording'); // Clear the flag
 
           // Check if Parakeet transcription model is ready before starting
           const parakeetReady = await checkParakeetReady();
