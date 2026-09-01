@@ -5,6 +5,7 @@ import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
+import { useAssistant } from '@/contexts/AssistantContext';
 import { storageService } from '@/services/storageService';
 import { transcriptService } from '@/services/transcriptService';
 import Analytics from '@/lib/analytics';
@@ -69,11 +70,43 @@ export function useRecordingStop(
 
   const router = useRouter();
 
+  const { status: assistantStatus, note } = useAssistant();
+
   // Guard to prevent duplicate/concurrent stop calls (e.g., from UI and tray simultaneously)
   const stopInProgressRef = useRef(false);
 
   // Promise to track recording-stopped event data (fixes race condition with recording-stop-complete)
   const recordingStoppedDataRef = useRef<Promise<void> | null>(null);
+
+  // When the assistant is enabled, auto-navigation to the meeting details page
+  // waits for the end-of-meeting note flow to resolve (saved or discarded)
+  // instead of firing on a fixed delay - see the note.state effect below.
+  const pendingNavigationRef = useRef<string | null>(null);
+  const prevNoteStateRef = useRef(note.state);
+
+  const navigateToMeeting = useCallback((meetingId: string) => {
+    router.push(`/meeting-details?id=${meetingId}&source=recording`);
+    clearTranscripts();
+    Analytics.trackPageView('meeting_details');
+    setStatus(RecordingStatus.IDLE);
+    pendingNavigationRef.current = null;
+  }, [router, clearTranscripts, setStatus]);
+
+  // Fires the deferred navigation once the note flow resolves: saved, or
+  // discarded (a 'ready' -> 'idle' transition). Drafting nothing and
+  // navigating away manually is already possible and needs no handling here.
+  useEffect(() => {
+    const prevState = prevNoteStateRef.current;
+    prevNoteStateRef.current = note.state;
+
+    if (!pendingNavigationRef.current) return;
+
+    const saved = note.state === 'saved';
+    const discarded = prevState === 'ready' && note.state === 'idle';
+    if (saved || discarded) {
+      navigateToMeeting(pendingNavigationRef.current);
+    }
+  }, [note.state, navigateToMeeting]);
 
   // Set up recording-stopped listener for meeting navigation
   useEffect(() => {
@@ -335,15 +368,16 @@ export function useRecordingStop(
             duration: 10000,
           });
 
-          // Auto-navigate after a short delay with source parameter
-          setTimeout(() => {
-            router.push(`/meeting-details?id=${meetingId}&source=recording`);
-            clearTranscripts()
-            Analytics.trackPageView('meeting_details');
-
-            // Reset to IDLE after navigation
-            setStatus(RecordingStatus.IDLE);
-          }, 2000);
+          // Auto-navigate after a short delay - unless the assistant is enabled,
+          // in which case the user stays on the note bar (Draft -> preview ->
+          // Save/Discard) and navigation is deferred to the note.state effect.
+          if (assistantStatus.enabled) {
+            pendingNavigationRef.current = meetingId;
+          } else {
+            setTimeout(() => {
+              navigateToMeeting(meetingId);
+            }, 2000);
+          }
           // Track meeting completion analytics
           try {
             // Calculate meeting duration from transcript timestamps
@@ -435,6 +469,8 @@ export function useRecordingStop(
     meetings,
     setIsMeetingActive,
     router,
+    assistantStatus.enabled,
+    navigateToMeeting,
   ]);
 
   // Expose handleRecordingStop function to window for Rust callbacks
