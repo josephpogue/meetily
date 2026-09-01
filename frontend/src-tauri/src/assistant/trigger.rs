@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::card::content_words;
 use super::transcript::Speaker;
 
 const MIN_WORDS: usize = 2;
@@ -325,39 +326,6 @@ const ASK_PHRASES: &[&str] = &[
     "walk us through",
     "walk me through",
 ];
-
-// TODO(task-6): CardFormat.swift owns contentWords/stem/stopwords in v1; when
-// card.rs lands, move this there and have trigger.rs import it, matching v1's
-// dependency direction (Trigger depends on Card, not the reverse).
-const STOPWORDS: &[&str] = &[
-    "that", "this", "with", "from", "your", "yours", "they", "them", "then", "than", "have",
-    "does", "will", "would", "could", "should", "which", "what", "when", "where", "into", "onto",
-    "over", "under", "about", "actually", "really", "just", "only", "also", "both", "some",
-    "more", "most", "much", "very", "here", "there", "these", "those", "still", "been", "being",
-    "were", "weren", "wasn", "isn", "aren", "didn", "doesn",
-];
-
-fn content_words(s: &str) -> HashSet<String> {
-    s.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| w.chars().count() >= 4 && !STOPWORDS.contains(w))
-        .map(stem)
-        .collect()
-}
-
-/// Crude plural and third-person stripping. Load-bearing rather than
-/// cosmetic: without it "Proposal 3 holds" and "Proposals 3 and 4 hold" share
-/// no words at all. Words ending in a double s are left alone.
-fn stem(word: &str) -> String {
-    let char_count = word.chars().count();
-    if char_count >= 5 && word.ends_with('s') && !word.ends_with("ss") {
-        let mut chars: Vec<char> = word.chars().collect();
-        chars.pop();
-        chars.into_iter().collect()
-    } else {
-        word.to_string()
-    }
-}
 
 #[cfg(test)]
 mod tests {
